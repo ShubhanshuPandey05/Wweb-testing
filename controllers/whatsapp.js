@@ -21,8 +21,77 @@ const getPuppeteerArgs = () => {
     '--no-first-run',
     '--no-zygote',
     '--single-process',
-    '--disable-gpu'
+    '--disable-gpu',
+    '--disable-extensions',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-default-apps',
+    '--disable-background-networking',
+    '--mute-audio',
+    '--hide-scrollbars'
   ];
+};
+
+// Clean client sessions to prevent corruption
+const cleanSessions = (userId) => {
+  try {
+    const sessionDir = path.resolve(__dirname, `../sessions/${userId}`);
+    if (fs.existsSync(sessionDir)) {
+      console.log(`Cleaning session directory for user ${userId}`);
+      
+      // Keep these files/folders but remove all others to ensure clean state
+      const keepFiles = ['.'];
+      
+      // Get all files in the session directory
+      const files = fs.readdirSync(sessionDir);
+      
+      // Remove each file that's not in the keepFiles list
+      for (const file of files) {
+        if (!keepFiles.includes(file)) {
+          const filePath = path.join(sessionDir, file);
+          try {
+            if (fs.lstatSync(filePath).isDirectory()) {
+              fs.rmSync(filePath, { recursive: true, force: true });
+            } else {
+              fs.unlinkSync(filePath);
+            }
+          } catch (error) {
+            console.error(`Error removing file ${filePath}:`, error.message);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`Error cleaning sessions for user ${userId}:`, error.message);
+  }
+};
+
+// Properly destroy a client
+const destroyClient = async (client) => {
+  if (!client) return;
+
+  return new Promise((resolve) => {
+    try {
+      // Add a timeout to make sure we don't hang
+      const timeout = setTimeout(() => {
+        console.log('Destroy client timed out, forcing resolve');
+        resolve();
+      }, 5000);
+
+      client.destroy()
+        .then(() => {
+          clearTimeout(timeout);
+          resolve();
+        })
+        .catch((error) => {
+          console.error('Error during client destroy:', error.message);
+          clearTimeout(timeout);
+          resolve();
+        });
+    } catch (error) {
+      console.error('Exception during destroyClient:', error.message);
+      resolve();
+    }
+  });
 };
 
 // @desc    Initialize WhatsApp and get QR code
@@ -35,12 +104,15 @@ exports.initWhatsapp = async (req, res) => {
     // If client already exists, destroy it to start fresh
     if (activeClients[userId]) {
       try {
-        await activeClients[userId].destroy();
+        await destroyClient(activeClients[userId]);
       } catch (error) {
         console.log('Error destroying previous client:', error.message);
       }
       delete activeClients[userId];
     }
+
+    // Clean sessions to prevent corrupted state
+    cleanSessions(userId);
 
     // Create client session directory
     const sessionDir = path.resolve(__dirname, `../sessions/${userId}`);
@@ -65,7 +137,17 @@ exports.initWhatsapp = async (req, res) => {
         handleSIGINT: false,
         handleSIGTERM: false,
         handleSIGHUP: false,
-      }
+        ignoreHTTPSErrors: true,
+        protocolTimeout: 60000, // Increase protocol timeout to 60s
+        timeout: 60000, // Increase overall browser launch timeout to 60s
+      },
+      webVersion: '2.2334.12',
+      webVersionCache: {
+        type: 'none',
+      },
+      restartOnAuthFail: true,
+      takeoverOnConflict: true,
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
     });
     
     // Store client globally
@@ -107,6 +189,8 @@ exports.initWhatsapp = async (req, res) => {
     client.on('auth_failure', async (msg) => {
       console.error('AUTHENTICATION FAILURE', msg);
       await User.findByIdAndUpdate(userId, { whatsappConnected: false });
+      // Clean sessions on auth failure to force fresh login
+      cleanSessions(userId);
       sendResponse({ success: false, message: 'Authentication failed', error: msg });
     });
 
@@ -114,6 +198,12 @@ exports.initWhatsapp = async (req, res) => {
     client.on('disconnected', async (reason) => {
       console.log('Client was disconnected', reason);
       await User.findByIdAndUpdate(userId, { whatsappConnected: false });
+      // Clean up properly
+      try {
+        await destroyClient(activeClients[userId]);
+      } catch (error) {
+        console.error('Error destroying client on disconnect:', error.message);
+      }
       delete activeClients[userId];
     });
 
@@ -121,7 +211,7 @@ exports.initWhatsapp = async (req, res) => {
     try {
       await client.initialize();
       
-      // If no response sent after 20 seconds, check if authenticated
+      // If no response sent after 30 seconds, check if authenticated
       setTimeout(async () => {
         if (!responseHasBeenSent) {
           try {
@@ -139,9 +229,11 @@ exports.initWhatsapp = async (req, res) => {
             sendResponse({ success: false, message: 'Initialization timed out', error: error.message });
           }
         }
-      }, 20000);
+      }, 30000);
     } catch (error) {
       console.error('Client initialization error:', error);
+      // Clean sessions on initialization error
+      cleanSessions(userId);
       sendResponse({ success: false, message: 'Failed to initialize WhatsApp client', error: error.message });
     }
     
@@ -180,9 +272,12 @@ exports.disconnectWhatsapp = async (req, res) => {
     
     // If client exists, destroy it
     if (activeClients[userId]) {
-      await activeClients[userId].destroy();
+      await destroyClient(activeClients[userId]);
       delete activeClients[userId];
     }
+    
+    // Clean sessions on disconnect
+    cleanSessions(userId);
     
     // Update user status in database
     await User.findByIdAndUpdate(userId, { whatsappConnected: false });
