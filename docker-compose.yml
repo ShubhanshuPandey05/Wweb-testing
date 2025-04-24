@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017/whatsapp-automation
+      - JWT_SECRET=your_jwt_secret_key_here
+      - PORT=5000
+      - NODE_ENV=production
+    volumes:
+      - ./uploads:/app/uploads
+      - ./sessions:/app/sessions
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+    
+  mongodb:
+    image: mongo:6
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    restart: unless-stopped
+
+volumes:
+  mongodb_data: 
