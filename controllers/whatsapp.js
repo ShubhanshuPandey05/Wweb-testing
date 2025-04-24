@@ -1,4 +1,5 @@
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const puppeteer = require('puppeteer-core');
 const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
@@ -29,6 +30,48 @@ const getPuppeteerArgs = () => {
     '--mute-audio',
     '--hide-scrollbars'
   ];
+};
+
+// Custom browser launcher to handle browser initialization safely
+const createBrowser = async () => {
+  console.log('Launching custom browser...');
+  const args = getPuppeteerArgs();
+  
+  try {
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: args,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
+      ignoreHTTPSErrors: true,
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
+      timeout: 120000,
+      protocolTimeout: 120000,
+      defaultViewport: {
+        width: 1280,
+        height: 900
+      }
+    });
+    
+    // Event listeners to prevent unexpected closures
+    browser.on('disconnected', () => {
+      console.log('Browser disconnected event fired');
+    });
+    
+    // Create and prepare initial page to ensure browser is working
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36');
+    
+    // Navigate to a blank page to test browser
+    await page.goto('about:blank');
+    console.log('Browser launched and initial page loaded successfully');
+    
+    return browser;
+  } catch (error) {
+    console.error('Error launching browser:', error);
+    throw error;
+  }
 };
 
 // Clean client sessions to prevent corruption
@@ -74,21 +117,60 @@ const destroyClient = async (client) => {
       // Add a timeout to make sure we don't hang
       const timeout = setTimeout(() => {
         console.log('Destroy client timed out, forcing resolve');
+        
+        // If client has a browser property, try to close it directly
+        if (client._browser) {
+          try {
+            console.log('Attempting to close browser directly after timeout');
+            client._browser.close().catch(e => console.error('Error closing browser:', e.message));
+          } catch (err) {
+            console.error('Error in browser close after timeout:', err.message);
+          }
+        }
+        
         resolve();
-      }, 5000);
+      }, 10000);
+
+      // Store browser reference before destroying client
+      const browser = client._browser;
 
       client.destroy()
         .then(() => {
           clearTimeout(timeout);
+          
+          // After successful client destroy, ensure browser is also closed
+          if (browser) {
+            console.log('Client destroyed, closing browser');
+            browser.close().catch(e => console.error('Error closing browser after destroy:', e.message));
+          }
+          
           resolve();
         })
         .catch((error) => {
           console.error('Error during client destroy:', error.message);
           clearTimeout(timeout);
+          
+          // If client destroy fails, try to close browser directly
+          if (browser) {
+            console.log('Client destroy failed, trying to close browser directly');
+            browser.close().catch(e => console.error('Error closing browser after failed destroy:', e.message));
+          }
+          
           resolve();
         });
     } catch (error) {
       console.error('Exception during destroyClient:', error.message);
+      
+      // Final attempt to close browser if all else fails
+      try {
+        if (client._browser) {
+          console.log('Exception in destroyClient, final attempt to close browser');
+          client._browser.close().catch(e => console.error('Error in final browser close:', e.message));
+        }
+      } catch (err) {
+        console.error('Error in final browser close attempt:', err.message);
+      }
+      
       resolve();
     }
   });
@@ -98,12 +180,15 @@ const destroyClient = async (client) => {
 // @route   GET /api/whatsapp/init
 // @access  Private
 exports.initWhatsapp = async (req, res) => {
+  let browser = null;
+  
   try {
     const userId = req.user._id.toString();
     
     // If client already exists, destroy it to start fresh
     if (activeClients[userId]) {
       try {
+        console.log('Destroying existing client');
         await destroyClient(activeClients[userId]);
       } catch (error) {
         console.log('Error destroying previous client:', error.message);
@@ -124,22 +209,29 @@ exports.initWhatsapp = async (req, res) => {
     const puppeteerArgs = getPuppeteerArgs();
     console.log('Using Puppeteer args:', puppeteerArgs);
 
+    // Launch custom browser first
+    try {
+      console.log('Launching browser...');
+      browser = await createBrowser();
+      console.log('Browser launched successfully');
+    } catch (error) {
+      console.error('Failed to launch browser:', error);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to initialize WhatsApp - browser launch failed', 
+        error: error.message 
+      });
+    }
+
     // Create a new client with proper configuration for cloud environments
+    console.log('Creating WhatsApp client with custom browser');
     const client = new Client({
       authStrategy: new LocalAuth({ 
         clientId: userId, 
         dataPath: path.resolve(__dirname, '../sessions') 
       }),
       puppeteer: {
-        headless: true,
-        args: puppeteerArgs,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        handleSIGINT: false,
-        handleSIGTERM: false,
-        handleSIGHUP: false,
-        ignoreHTTPSErrors: true,
-        protocolTimeout: 60000, // Increase protocol timeout to 60s
-        timeout: 60000, // Increase overall browser launch timeout to 60s
+        browser: browser, // Use our pre-initialized browser
       },
       webVersion: '2.2334.12',
       webVersionCache: {
@@ -149,6 +241,9 @@ exports.initWhatsapp = async (req, res) => {
       takeoverOnConflict: true,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
     });
+    
+    // Store browser reference for cleanup
+    client._browser = browser;
     
     // Store client globally
     activeClients[userId] = client;
@@ -166,8 +261,11 @@ exports.initWhatsapp = async (req, res) => {
 
     // Generate QR code
     let qrCode = null;
+    let hasReceivedQr = false;
+    
     client.on('qr', async (qr) => {
-      console.log('QR RECEIVED', qr);
+      console.log('QR RECEIVED', qr.substring(0, 20) + '...');
+      hasReceivedQr = true;
       try {
         qrCode = await qrcode.toDataURL(qr);
         sendResponse({ success: true, data: { qrCode } });
@@ -209,7 +307,49 @@ exports.initWhatsapp = async (req, res) => {
 
     // Initialize the client and handle initialization errors
     try {
-      await client.initialize();
+      console.log('Starting WhatsApp client initialization...');
+      
+      // Add a timeout that will check QR status
+      const qrTimeout = setTimeout(() => {
+        if (!hasReceivedQr && !responseHasBeenSent) {
+          console.log('No QR received after timeout, trying to recover...');
+          
+          try {
+            if (browser && !browser.isConnected()) {
+              console.log('Browser disconnected, sending failure response');
+              sendResponse({ 
+                success: false, 
+                message: 'Failed to initialize WhatsApp - browser disconnected',
+                error: 'Browser disconnected before QR code generation'
+              });
+            } else {
+              console.log('No QR generated but browser is connected, sending retry message');
+              sendResponse({ 
+                success: false, 
+                message: 'Failed to generate QR code. Please try again.',
+                error: 'QR code generation timed out' 
+              });
+            }
+          } catch (error) {
+            console.error('Error in QR timeout handler:', error);
+            sendResponse({ 
+              success: false, 
+              message: 'Failed to initialize WhatsApp',
+              error: error.message
+            });
+          }
+        }
+      }, 20000);
+      
+      // Add initialization timeout
+      const initPromise = client.initialize();
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('WhatsApp initialization timed out after 45 seconds')), 45000);
+      });
+      
+      // Race the initialization against the timeout
+      await Promise.race([initPromise, timeoutPromise]);
+      clearTimeout(qrTimeout);
       
       // If no response sent after 30 seconds, check if authenticated
       setTimeout(async () => {
@@ -235,10 +375,27 @@ exports.initWhatsapp = async (req, res) => {
       // Clean sessions on initialization error
       cleanSessions(userId);
       sendResponse({ success: false, message: 'Failed to initialize WhatsApp client', error: error.message });
+      
+      // Close browser on error
+      try {
+        if (browser) await browser.close();
+      } catch (err) {
+        console.error('Error closing browser after initialization failure:', err);
+      }
     }
     
   } catch (error) {
     console.error('WhatsApp initialization error:', error);
+    
+    // Cleanup browser if it exists
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (err) {
+        console.error('Error closing browser after general error:', err);
+      }
+    }
+    
     res.status(500).json({ success: false, message: 'Could not initialize WhatsApp', error: error.message });
   }
 };
